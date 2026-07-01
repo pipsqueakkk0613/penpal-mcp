@@ -1,0 +1,23 @@
+{
+  "name": "penpal-mcp",
+  "version": "1.0.0",
+  "description": "QQ邮箱笔友 MCP 服务器 — 让小机发邮件、收邮件、交笔友",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "penpal": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["mcp", "email", "qq-mail", "penpal", "imap", "smtp"],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^17.0.0",
+    "express": "^4.21.0",
+    "imapflow": "^1.0.0",
+    "nodemailer": "^6.9.0",
+    "zod": "^3.23.0"
+  }
+}
