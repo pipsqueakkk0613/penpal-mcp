@@ -176,71 +176,93 @@ function createMcpServer() {
             let body = '';
             if (msg.source) {
               const src = Buffer.from(msg.source).toString('utf-8');
-              const srcLF = src.replace(/\r\n/g, '\n');
 
-              // 解析 MIME part 的辅助函数
-              const decodePart = (headers, rawBody) => {
-                const enc = (headers.match(/Content-Transfer-Encoding:\s*(\S+)/i) || [])[1]?.toLowerCase();
-                let text = rawBody.replace(/\r/g, '').trim();
-                if (enc === 'base64') {
-                  try { text = Buffer.from(text.replace(/[\s\n]/g, ''), 'base64').toString('utf-8'); } catch {}
-                } else if (enc === 'quoted-printable') {
-                  text = text.replace(/=\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-                }
-                return text;
-              };
+              // 找到最后一个 Content-Type 和其后的 Content-Transfer-Encoding
+              const ctMatch = src.match(/Content-Type:\s*([^\r\n;]+)/gi);
+              const lastCT = ctMatch?.[ctMatch.length - 1]?.replace(/Content-Type:\s*/i, '') || '';
+              const ctPos = src.lastIndexOf('Content-Type:');
 
-              // 方式 1: MIME boundary 切分（QQ邮箱 / Gmail multipart）
-              const bm = srcLF.match(/boundary="?([^"\n]+?)"?\n/i);
-              const boundary = bm?.[1];
-              if (boundary) {
-                const parts = srcLF.split('--' + boundary);
+              // 从最后一个 Content-Type 开始找 CTE
+              const afterCT = src.substring(ctPos);
+              const cteMatch = afterCT.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+              const encoding = cteMatch?.[1]?.toLowerCase() || '7bit';
+
+              // 找 body 起始位置（最后一个 header 后的 \r\n\r\n 或 \n\n）
+              const bodyStart1 = afterCT.indexOf('\r\n\r\n');
+              const bodyStart2 = afterCT.indexOf('\n\n');
+              let bodyStart = -1;
+              if (bodyStart1 >= 0) bodyStart = ctPos + bodyStart1 + 4;
+              else if (bodyStart2 >= 0) bodyStart = ctPos + bodyStart2 + 2;
+
+              let rawBody = '';
+              if (bodyStart > 0) {
+                rawBody = src.substring(bodyStart);
+              } else {
+                rawBody = src; // 兜底
+              }
+
+              // 如果是 multipart，按 boundary 切
+              const bm = afterCT.match(/boundary="?([^"\r\n]+?)"?/i);
+              if (bm?.[1]) {
+                const parts = src.split('--' + bm[1]);
                 for (const part of parts) {
-                  const headerEnd = part.indexOf('\n\n');
-                  if (headerEnd < 0) continue;
-                  const headers = part.substring(0, headerEnd);
-                  const rawBody = part.substring(headerEnd + 2);
-                  // 优先取 text/plain，跳过 text/html 和 multipart/alternative
-                  if (headers.includes('text/plain') && !headers.includes('text/html')) {
-                    body = decodePart(headers, rawBody);
-                    if (body) break;
+                  if (part.includes('Content-Type: text/plain') && !part.includes('Content-Type: text/html')) {
+                    const pe = part.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+                    const pb = part.indexOf('\r\n\r\n') >= 0 ? part.indexOf('\r\n\r\n') + 4 : part.indexOf('\n\n') + 2;
+                    if (pb > 2) {
+                      rawBody = part.substring(pb);
+                      encoding === 'base64'; // use part's encoding
+                      if (pe?.[1]?.toLowerCase() === 'base64') {
+                        try { body = Buffer.from(rawBody.replace(/[\s\n]/g, ''), 'base64').toString('utf-8'); } catch {}
+                      } else if (pe?.[1]?.toLowerCase() === 'quoted-printable') {
+                        body = rawBody.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_,h) => String.fromCharCode(parseInt(h,16)));
+                      } else {
+                        body = rawBody.trim();
+                      }
+                      if (body) break;
+                    }
                   }
                 }
-                // fallback: 取第一个能解析出正文的 text/html
+                // fallback: text/html
                 if (!body) {
                   for (const part of parts) {
-                    const headerEnd = part.indexOf('\n\n');
-                    if (headerEnd < 0) continue;
-                    const headers = part.substring(0, headerEnd);
-                    if (headers.includes('text/html') && !headers.includes('multipart/alternative')) {
-                      let html = decodePart(headers, part.substring(headerEnd + 2));
-                      if (html) {
+                    if (part.includes('Content-Type: text/html')) {
+                      const pe = part.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+                      const pb = part.indexOf('\r\n\r\n') >= 0 ? part.indexOf('\r\n\r\n') + 4 : part.indexOf('\n\n') + 2;
+                      if (pb > 2) {
+                        let html = part.substring(pb);
+                        if (pe?.[1]?.toLowerCase() === 'base64') {
+                          try { html = Buffer.from(html.replace(/[\s\n]/g, ''), 'base64').toString('utf-8'); } catch {}
+                        }
                         body = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
                           .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
                           .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
                           .replace(/\s+/g, ' ').trim();
-                        if (body) break;
+                        break;
                       }
                     }
                   }
                 }
-              }
-
-              // 方式 2: 非 multipart（纯 text/plain）
-              if (!body) {
-                const re = /Content-Type:\s*text\/plain[\s\S]*?(?:Content-Transfer-Encoding:\s*(\S+))?[\s\S]*?\n\n([\s\S]*?)(?:\n--[A-Za-z0-9]|$)/i;
-                const m = srcLF.match(re);
-                if (m) {
-                  body = decodePart('Content-Transfer-Encoding: ' + (m[1] || '7bit'), m[2] || '');
+              } else {
+                // 非 multipart：直接解
+                if (encoding === 'base64') {
+                  try { body = Buffer.from(rawBody.replace(/[\s\n]/g, ''), 'base64').toString('utf-8'); } catch {}
+                } else if (encoding === 'quoted-printable') {
+                  body = rawBody.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_,h) => String.fromCharCode(parseInt(h,16)));
+                } else {
+                  body = rawBody.trim();
+                }
+                // text/html fallback
+                if (body && lastCT === 'text/html') {
+                  body = body.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+                    .replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+                    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+                    .replace(/\s+/g, ' ').trim();
                 }
               }
 
-              // 方式 3: 最后兜底——全文 base64
               if (!body) {
-                const allB64 = srcLF.match(/Content-Transfer-Encoding:\s*base64\n\n([A-Za-z0-9+/=\s]+)/i);
-                if (allB64?.[1]) {
-                  try { body = Buffer.from(allB64[1].replace(/[\s\n]/g, ''), 'base64').toString('utf-8'); } catch {}
-                }
+                try { body = Buffer.from(rawBody.replace(/[\s\n]/g, ''), 'base64').toString('utf-8'); } catch {}
               }
 
               if (body && body.length > 5000) body = body.substring(0, 5000) + '\n\n[... 内容过长，已截断 ...]';
