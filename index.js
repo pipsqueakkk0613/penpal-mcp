@@ -116,16 +116,17 @@ function createMcpServer() {
 
           for await (const msg of client.fetch(`${start}:${end}`, {
             envelope: true,
-            bodyStructure: true,
+            flags: true,
             uid: true,
           })) {
+            const isSeen = msg.flags?.has?.('\\Seen') ?? !msg.flags?.includes?.('\\Seen') ?? false;
             messages.unshift({
               uid: msg.uid,
               subject: msg.envelope.subject || '(无主题)',
               from: msg.envelope.from?.[0]?.address || '未知',
               fromName: msg.envelope.from?.[0]?.name || '',
               date: msg.envelope.date?.toISOString() || '',
-              seen: !msg.flags.has('\\Seen'),
+              seen: isSeen,
             });
           }
 
@@ -170,15 +171,59 @@ function createMcpServer() {
           for await (const msg of client.fetch({ uid: params.uid }, {
             source: true,
             envelope: true,
-            bodyParts: ['HEADER', 'TEXT'],
             uid: true,
           })) {
-            const headerPart = msg.bodyParts.get('HEADER');
-            const textPart  = msg.bodyParts.get('TEXT');
             let body = '';
-            if (textPart) {
-              body = Buffer.from(textPart.buffer || '').toString('utf-8');
-              // 简单清理：截断过长内容
+            if (msg.source) {
+              const src = Buffer.from(msg.source).toString('utf-8');
+              // QQ邮箱全文 base64 编码：按 MIME 边界拆分，逐段解码
+              const boundaryMatch = src.match(/boundary="([^"]+)"/);
+              const boundary = boundaryMatch?.[1];
+
+              if (boundary) {
+                // multipart 邮件：按边界切分
+                const parts = src.split('--' + boundary);
+                for (const part of parts) {
+                  if (part.includes('Content-Type: text/plain') && !part.includes('Content-Type: text/html')) {
+                    const isBase64 = part.includes('Content-Transfer-Encoding: base64');
+                    const isQP = part.includes('Content-Transfer-Encoding: quoted-printable');
+                    const bodyStart = part.indexOf('\r\n\r\n');
+                    if (bodyStart > 0) {
+                      let raw = part.substring(bodyStart + 4).trim();
+                      if (isBase64) {
+                        try { body = Buffer.from(raw.replace(/\s/g, ''), 'base64').toString('utf-8'); } catch {}
+                      } else if (isQP) {
+                        body = raw.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_,h) => String.fromCharCode(parseInt(h,16)));
+                      } else {
+                        body = raw;
+                      }
+                      if (body) break;
+                    }
+                  }
+                }
+              }
+              if (!body) {
+                // 非 multipart：直接找 text/plain 块
+                const re = /Content-Type:\s*text\/plain[\s\S]*?(?:Content-Transfer-Encoding:\s*(base64|quoted-printable|7bit|8bit))?[\s\S]*?\r?\n\r?\n([\s\S]*?)(?:\r?\n--[A-Za-z0-9]|$)/;
+                const m = src.match(re);
+                if (m) {
+                  let raw = (m[2] || '').trim();
+                  if (m[1] === 'base64') {
+                    try { body = Buffer.from(raw.replace(/\s/g, ''), 'base64').toString('utf-8'); } catch {}
+                  } else if (m[1] === 'quoted-printable') {
+                    body = raw.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (_,h) => String.fromCharCode(parseInt(h,16)));
+                  } else {
+                    body = raw;
+                  }
+                }
+              }
+              if (!body) {
+                // 最后兜底：全文 text/plain 或 text/html
+                const allB64 = src.match(/Content-Transfer-Encoding:\s*base64\r?\n\r?\n([A-Za-z0-9+/=\s]+)/);
+                if (allB64?.[1]) {
+                  try { body = Buffer.from(allB64[1].replace(/\s/g, ''), 'base64').toString('utf-8'); } catch {}
+                }
+              }
               if (body.length > 5000) body = body.substring(0, 5000) + '\n\n[... 内容过长，已截断 ...]';
             }
 
