@@ -19,6 +19,7 @@ import nodemailer from 'nodemailer';
 import { ImapFlow } from 'imapflow';
 
 const PORT = parseInt(process.env.PORT || '3457', 10);
+const BASE_PATH = process.env.BASE_PATH || ''; // nginx 代理前缀，如 /penpal
 
 // ═══════════════════════════════════════
 //  SMTP 发件器
@@ -322,13 +323,14 @@ app.all('/mcp', async (req, res) => {
 });
 
 app.get('/sse', async (req, res) => {
-  const transport = new SSEServerTransport('/messages', res);
+  const transport = new SSEServerTransport(BASE_PATH + '/messages', res);
   transports[transport.sessionId] = transport;
   res.on('close', () => { delete transports[transport.sessionId]; });
   const mcpServer = createMcpServer();
   await mcpServer.connect(transport);
 });
 
+// POST 路由不需要 BASE_PATH（nginx 代理时会自动剥离前缀）
 app.post('/messages', async (req, res) => {
   const sessionId = req.query.sessionId;
   const transport = transports[sessionId];
